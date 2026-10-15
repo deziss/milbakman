@@ -197,6 +197,34 @@ class S3Client:
             if not (truncated and token):
                 return
 
+    def list_prefixes(self, bucket, prefix=""):
+        """Immediate sub-"folders" under prefix (ListObjectsV2 with delimiter '/')."""
+        token = None
+        while True:
+            params = {"list-type": "2", "delimiter": "/", "max-keys": "1000"}
+            if prefix.strip("/"):
+                params["prefix"] = prefix.strip("/") + "/"
+            if token:
+                params["continuation-token"] = token
+            try:
+                with self._open(self._request("GET", bucket, params=params)) as resp:
+                    root = ET.fromstring(resp.read())
+            except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+                raise S3Error(f"cannot list bucket '{bucket}' at {self.endpoint}: {describe_error(e)}") from None
+            truncated, token = False, None
+            for elem in root:
+                tag = elem.tag.rsplit("}", 1)[-1]
+                if tag == "CommonPrefixes":
+                    for child in elem:
+                        if child.tag.rsplit("}", 1)[-1] == "Prefix" and child.text:
+                            yield child.text.rstrip("/").rsplit("/", 1)[-1]
+                elif tag == "IsTruncated":
+                    truncated = (elem.text or "").strip().lower() == "true"
+                elif tag == "NextContinuationToken":
+                    token = elem.text
+            if not (truncated and token):
+                return
+
     def head_size(self, bucket, key):
         """Object size in bytes, or None if it does not exist."""
         try:
@@ -300,6 +328,14 @@ class LocalStore:
                 if name.endswith(PARTIAL_SUFFIX) or os.path.islink(full) or not os.path.isfile(full):
                     continue
                 yield {"key": os.path.relpath(full, self.root).replace(os.sep, "/"), "size": os.path.getsize(full)}
+
+    def list_prefixes(self, bucket, prefix=""):
+        base = os.path.join(self.root, *[part for part in prefix.strip("/").split("/") if part])
+        if not os.path.isdir(base):
+            return
+        for name in sorted(os.listdir(base)):
+            if os.path.isdir(os.path.join(base, name)) and not os.path.islink(os.path.join(base, name)):
+                yield name
 
     def head_size(self, bucket, key):
         try:

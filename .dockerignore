@@ -1,3 +1,5 @@
 *
 !scripts/seed_benchmark.py
 !scripts/verify_restore.py
+!scripts/audit_storage.py
+!scripts/migrate_s3.py

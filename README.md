@@ -90,6 +90,7 @@ Endpoint, port and SSL default sensibly per provider: MinIO uses `localhost:9000
 | `deploy-target [--reset]` / `down-target [-v]` | Start or stop a target Milvus wired to `TARGET_*` storage. With `TARGET_S3_PROVIDER=local` it bind-mounts `TARGET_LOCAL_DATA_DIR`. |
 | `verify --compare [--suffix S] [--collections a,b]` | Compare entity counts per collection between source and target. |
 | `verify [--collection C --count N]` / `seed` | Check, or create, the seeded benchmark collection. |
+| `audit [source\|target] [--json] [--top N]` | Read-only. Shows how much data under the Milvus storage root belongs to the current Milvus vs. unknown collection IDs (an older Milvus or dropped collections). See [Shared or reused bucket](#shared-or-reused-bucket). |
 | `version`, `help` | Print the version or the built-in help. |
 
 ## Command cookbook
@@ -147,6 +148,8 @@ Downloads stream file by file with any file size, run in parallel, and resume: r
 ./milvus.sh config                     # effective config for backups (secrets masked)
 ./milvus.sh config target --s3         # effective config for an object-storage restore into the target
 ./milvus.sh prune                      # apply retention now
+./milvus.sh audit                      # source storage: current vs unknown data (read-only)
+./milvus.sh audit target --json        # same for the target, machine-readable
 ```
 
 ### Target Milvus and verification
@@ -195,6 +198,41 @@ After each local backup, the oldest backups in that cadence folder beyond `RETEN
 - It runs as root only when it must write into a local-disk Milvus data dir, which the Milvus container owns. Override with `MILVUS_BACKUP_RUN_AS`.
 - Generated configs, which hold credentials, are mode 600 in a private temp dir and are removed on exit.
 
+## Shared or reused bucket
+
+Milvus may share its bucket, or even its root folder, with data an older Milvus left behind. **Backups still contain only the current Milvus's data.** milvus-backup asks the running Milvus for its collections and their persistent segments, then copies only those segments' files (`<root>/insert_log/<collection>/<partition>/<segment>/`, `delta_log/...`). Files of other collection IDs are never read.
+
+To see the split, run `./milvus.sh audit` (read-only, nothing is modified):
+
+```
+Storage audit of s3://a-bucket/files  (read-only)
+
+  KIND                          CURRENT                UNKNOWN
+  delta_log           1.20 MiB      14 obj       0 B       0 obj
+  insert_log          2.31 GiB    4210 obj   18.70 GiB  30112 obj
+  stats_log          12.40 MiB     402 obj   96.10 MiB   2880 obj
+  index_files         3.02 GiB     930 obj  (not part of backups)
+
+  Current collections (2):
+    default.products                          id 457198112...      2.11 GiB
+    default.users                             id 457198112...    214.32 MiB
+
+  Unknown collection IDs (7; top 7 by size):
+    id 449263331...         11.02 GiB  17020 objects
+    ...
+  Other top-level folders in bucket 'a-bucket': milvus-backups, old-files
+
+  Backups copy only CURRENT data: 2.32 GiB.
+  18.80 GiB in 7 unknown collection(s) is never backed up.
+```
+
+Things to know:
+- **Unknown** means collection IDs that the running Milvus does not know: an older Milvus that used this bucket/root, or collections you dropped that garbage collection hasn't removed yet.
+- **Milvus GC** may delete files under its own root that its metadata doesn't reference. That's harmless if the old Milvus is gone. If an old Milvus still runs against the **same root folder**, the two clean up each other's files. Give every Milvus its own root path.
+- **Raw copies are not filtered.** `scripts/migrate_s3.sh` copies everything under a prefix. To move only the current Milvus's data, use `backup` + `restore` instead.
+- **Cleaning up** old data is manual and irreversible. Stop and back up first, then delete only the `insert_log/<id>/`, `delta_log/<id>/` and `stats_log/<id>/` folders that `audit` lists as unknown.
+- `audit` uses the S3 API with static keys (or a local data dir). `--collection-ids a,b` audits against a given ID list without contacting Milvus.
+
 ## Migrating object storage (any object size)
 
 `scripts/migrate_s3.sh` copies Milvus backups or raw Milvus data between any two S3-compatible endpoints. It uses only the Python standard library. `download` and `upload` use the same engine with a local directory on one side, and `scripts/migrate_s3.py --src-dir/--dst-dir` exposes that directly.
@@ -224,6 +262,7 @@ templates/backup-config-generator.sh  storage resolution + milvus-backup config 
 scripts/migrate_s3.py / .sh         S3-to-S3 migration (multipart, parallel, resumable)
 scripts/seed_benchmark.py           benchmark data for testing
 scripts/verify_restore.py           restore verification (used by `verify`)
+scripts/audit_storage.py            read-only storage audit (used by `audit`)
 docker-compose.target.yml           target Milvus (+ .local.yml override for local-disk storage)
 docker-compose.primary.yml          demo source stack (Milvus + etcd + MinIO)
 Dockerfile.milvus-client            pymilvus image for verify/seed

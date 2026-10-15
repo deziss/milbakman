@@ -92,6 +92,9 @@ ${BOLD}Commands:${NC}
                  --compare [--suffix S] [--collections a,b]  (entity counts: source vs target)
                  or: --collection C --count N                (seeded benchmark check)
                  --host/--port (target), --source-host/--source-port
+  ${CYAN}audit${NC}          Read-only: how much data under the Milvus storage root belongs to the
+                 current Milvus vs. unknown (old Milvus / dropped collections)
+                 [source|target] [--json] [--top N] [--collection-ids a,b]
   ${CYAN}seed${NC}           Insert benchmark vectors   [--host H --port P --collection C --count N]
 
 ${BOLD}Examples:${NC}
@@ -473,17 +476,23 @@ cmd_restore() {
 # ------------------------------------------------------------------------------
 # download / upload (object storage <-> local disk, via scripts/migrate_s3.py)
 # ------------------------------------------------------------------------------
+# side_s3_check <SIDE>: the side's storage must be S3-API compatible with static keys
+side_s3_check() {
+    local side="$1" provider auth
+    provider="$(storage_provider "${side}")" || exit 1
+    case "${provider}" in
+        local) die "${side} object storage is not configured (provider 'local'); set ${side}_S3_PROVIDER." ;;
+        azure|gcpnative) die "This command uses the S3 API; provider '${provider}' is not S3-compatible (for GCS use provider 'gcp' with HMAC keys)." ;;
+    esac
+    auth="$(storage_auth "${side}")" || exit 1
+    [[ "${auth}" == "static" ]] || die "This command needs static access keys (${side} storage auth is '${auth}')."
+    [[ -z "$(sv "${side}" S3_SESSION_TOKEN)" ]] || die "This command does not support S3_SESSION_TOKEN; use long-lived keys."
+}
+
 # Sets S3_ARGS (--src-* or --dst-* flags) for the BACKUP object storage
 backup_s3_args() {
-    local flag="$1" provider auth
-    provider="$(storage_provider BACKUP)" || exit 1
-    case "${provider}" in
-        local) die "Backup object storage is not configured (provider 'local'); set BACKUP_S3_PROVIDER." ;;
-        azure|gcpnative) die "download/upload use the S3 API; provider '${provider}' is not S3-compatible (for GCS use provider 'gcp' with HMAC keys)." ;;
-    esac
-    auth="$(storage_auth BACKUP)" || exit 1
-    [[ "${auth}" == "static" ]] || die "download/upload need static access keys (backup storage auth is '${auth}')."
-    [[ -z "$(sv BACKUP S3_SESSION_TOKEN)" ]] || die "download/upload do not support S3_SESSION_TOKEN; use long-lived keys."
+    local flag="$1"
+    side_s3_check BACKUP
     S3_ARGS=(
         "--${flag}-endpoint" "$(storage_endpoint BACKUP):$(storage_port BACKUP)"
         "--${flag}-bucket" "$(storage_bucket BACKUP)"
@@ -784,10 +793,19 @@ ensure_client_image() {
     fi
 }
 
-# Credentials go through the environment, not argv
+# Credentials go through the environment, not argv. The scripts are mounted
+# from the checkout, so the image only has to provide pymilvus.
+# run_client [docker run options...] -- <script args...>
 run_client() {
     ensure_client_image
-    docker run --rm --network host -e MILVUS_USER -e MILVUS_PASSWORD "${CLIENT_IMAGE}" "$@"
+    local opts=()
+    while [[ $# -gt 0 && "$1" != "--" ]]; do
+        opts+=("$1")
+        shift
+    done
+    [[ "${1:-}" != "--" ]] || shift
+    docker run --rm --network host -e MILVUS_USER -e MILVUS_PASSWORD \
+        -v "${PROJECT_ROOT}/scripts:/app/scripts:ro" ${opts[@]+"${opts[@]}"} "${CLIENT_IMAGE}" "$@"
 }
 
 cmd_verify() {
@@ -815,10 +833,10 @@ cmd_verify() {
         local args=(--compare --source-host "${src_host}" --source-port "${src_port}" --host "${host}" --port "${port}")
         [[ -z "${suffix}" ]] || args+=(--suffix "${suffix}")
         [[ -z "${collections}" ]] || args+=(--collections "${collections}")
-        run_client /app/scripts/verify_restore.py "${args[@]}"
+        run_client -- /app/scripts/verify_restore.py "${args[@]}"
     else
         log_info "Verifying benchmark collection '${coll}' on ${host}:${port}"
-        run_client /app/scripts/verify_restore.py --host "${host}" --port "${port}" \
+        run_client -- /app/scripts/verify_restore.py --host "${host}" --port "${port}" \
             --collection "${coll}" --expected-count "${count}"
     fi
 }
@@ -834,7 +852,58 @@ cmd_seed() {
             *) log_error "Unknown option: $1"; usage 1 ;;
         esac
     done
-    run_client /app/scripts/seed_benchmark.py --host "${host}" --port "${port}" --collection "${coll}" --count "${count}"
+    run_client -- /app/scripts/seed_benchmark.py --host "${host}" --port "${port}" --collection "${coll}" --count "${count}"
+}
+
+# ------------------------------------------------------------------------------
+# audit (read-only: current vs unknown data under a Milvus storage root)
+# ------------------------------------------------------------------------------
+cmd_audit() {
+    local mode="source" json=false ids="" top=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            source|target)    mode="$1"; shift ;;
+            --json)           json=true; shift ;;
+            --collection-ids) ids="$(optval "$@")"; shift 2 ;;
+            --top)            top="$(optval "$@")"; shift 2 ;;
+            *) log_error "Unknown option: $1"; usage 1 ;;
+        esac
+    done
+
+    local side host port
+    side="$(side_upper "${mode}")"
+    if [[ "${mode}" == "target" ]]; then
+        host="${TARGET_MILVUS_HOST:-localhost}"; port="${TARGET_MILVUS_PORT:-19540}"
+    else
+        host="${SOURCE_MILVUS_HOST:-localhost}"; port="${SOURCE_MILVUS_PORT:-19530}"
+    fi
+
+    local opts=() args=(--milvus-host "${host}" --milvus-port "${port}")
+    if [[ "$(storage_provider "${side}")" == "local" ]]; then
+        local dir
+        dir="$(storage_local_dir "${side}")" || exit 1
+        [[ -d "${dir}" ]] || die "${side}_LOCAL_DATA_DIR does not exist: ${dir}"
+        opts+=(-v "${dir}:${dir}:ro")
+        args+=(--local-dir "${dir}")
+    else
+        side_s3_check "${side}"
+        local endpoint
+        endpoint="$(storage_endpoint "${side}")"
+        # localhost inside the container is the host itself (--network host)
+        args+=(--endpoint "${endpoint}:$(storage_port "${side}")" --bucket "$(storage_bucket "${side}")"
+               --region "$(sv_conn "${side}" S3_REGION us-east-1)" --ssl "$(storage_use_ssl "${side}")"
+               --root "$(storage_root_path "${side}")")
+        export AUDIT_ACCESS_KEY AUDIT_SECRET_KEY
+        AUDIT_ACCESS_KEY="$(sv "${side}" S3_ACCESS_KEY)"
+        AUDIT_SECRET_KEY="$(sv "${side}" S3_SECRET_KEY)"
+        opts+=(-e AUDIT_ACCESS_KEY -e AUDIT_SECRET_KEY)
+    fi
+    [[ -z "${ids}" ]] || args+=(--collection-ids "${ids}")
+    [[ -z "${top}" ]] || args+=(--top "${top}")
+    [[ "${json}" != "true" ]] || args+=(--json)
+
+    [[ "${json}" == "true" ]] || log_info "Auditing ${mode} storage $(describe_storage "${side}") against Milvus ${host}:${port} (read-only)"
+    run_client "${opts[@]}" -- /app/scripts/audit_storage.py "${args[@]}"
 }
 
 # ------------------------------------------------------------------------------
@@ -855,6 +924,7 @@ case "${COMMAND}" in
     deploy-target)  cmd_deploy_target "$@" ;;
     down-target)    cmd_down_target "$@" ;;
     verify)         cmd_verify "$@" ;;
+    audit)          cmd_audit "$@" ;;
     seed)           cmd_seed "$@" ;;
     version|--version) printf 'milbakman %s\n' "${MILBAKMAN_VERSION}" ;;
     help|-h|--help) usage 0 ;;
