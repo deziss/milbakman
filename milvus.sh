@@ -75,6 +75,12 @@ ${BOLD}Commands:${NC}
                  --filter <coll1,coll2>
                  --s3                         (skip local lookup, restore from object storage)
 
+  ${CYAN}download${NC}       Copy an object-storage backup to local disk (restorable offline)
+                 -b, --backup <name> (required)  -d, --dest <dir> (default: BACKUP_STORAGE_DIR/downloads)
+                 --workers <n>
+  ${CYAN}upload${NC}         Copy a local backup (name, archive or directory) to object storage
+                 -b, --backup <name|archive.tar.gz|directory> (required)  --workers <n>
+
   ${CYAN}list${NC}           List local and object-storage backups   [--local-only | --s3-only]
   ${CYAN}prune${NC}          Apply RETENTION_<CADENCE> to local backups (also runs after each backup)
   ${CYAN}status${NC}         Health of source, target and backup storage
@@ -263,8 +269,15 @@ cmd_backup() {
 }
 
 # Compress (optional) and write the manifest for a finished local backup
+# finalize_local_backup <dir> <name> <cadence> [origin description]
 finalize_local_backup() {
-    local dir="$1" name="$2" cadence="$3" format artifact
+    local dir="$1" name="$2" cadence="$3" origin="${4:-}" format artifact
+    local source_milvus="${SOURCE_MILVUS_HOST:-localhost}:${SOURCE_MILVUS_PORT:-19530}"
+    if [[ -n "${origin}" ]]; then
+        source_milvus="unknown (copied from ${origin})"
+    else
+        origin="$(describe_storage SOURCE)"
+    fi
     case "${BACKUP_COMPRESS:-gzip}" in
         none)
             format="dir"
@@ -296,8 +309,8 @@ finalize_local_backup() {
   "format": "${format}",
   "artifact": "$(json_escape "${artifact}")",
   "size": "$(json_escape "${size}")",
-  "source_milvus": "$(json_escape "${SOURCE_MILVUS_HOST:-localhost}:${SOURCE_MILVUS_PORT:-19530}")",
-  "source_storage": "$(json_escape "$(describe_storage SOURCE)")",
+  "source_milvus": "$(json_escape "${source_milvus}")",
+  "source_storage": "$(json_escape "${origin}")",
   "tool": "milbakman ${MILBAKMAN_VERSION}"
 }
 MANIFEST_EOF
@@ -455,6 +468,102 @@ cmd_restore() {
     backup_tool "${target_mode}" s3 rw "" "" restore -n "${backup_name}" "${restore_args[@]}" \
         || die "milvus-backup failed (exit $?); restore of '${backup_name}' FAILED."
     log_success "Backup '${backup_name}' restored into ${target_mode} Milvus."
+}
+
+# ------------------------------------------------------------------------------
+# download / upload (object storage <-> local disk, via scripts/migrate_s3.py)
+# ------------------------------------------------------------------------------
+# Sets S3_ARGS (--src-* or --dst-* flags) for the BACKUP object storage
+backup_s3_args() {
+    local flag="$1" provider auth
+    provider="$(storage_provider BACKUP)" || exit 1
+    case "${provider}" in
+        local) die "Backup object storage is not configured (provider 'local'); set BACKUP_S3_PROVIDER." ;;
+        azure|gcpnative) die "download/upload use the S3 API; provider '${provider}' is not S3-compatible (for GCS use provider 'gcp' with HMAC keys)." ;;
+    esac
+    auth="$(storage_auth BACKUP)" || exit 1
+    [[ "${auth}" == "static" ]] || die "download/upload need static access keys (backup storage auth is '${auth}')."
+    [[ -z "$(sv BACKUP S3_SESSION_TOKEN)" ]] || die "download/upload do not support S3_SESSION_TOKEN; use long-lived keys."
+    S3_ARGS=(
+        "--${flag}-endpoint" "$(storage_endpoint BACKUP):$(storage_port BACKUP)"
+        "--${flag}-bucket" "$(storage_bucket BACKUP)"
+        "--${flag}-region" "$(sv_conn BACKUP S3_REGION us-east-1)"
+        "--${flag}-ssl" "$(storage_use_ssl BACKUP)"
+    )
+}
+
+# Credentials reach the migrator through the environment, never argv
+run_migrator() {
+    have python3 || die "python3 (3.9+) is required for download/upload."
+    local key secret
+    key="$(sv BACKUP S3_ACCESS_KEY)"
+    secret="$(sv BACKUP S3_SECRET_KEY)"
+    SRC_ACCESS_KEY="${key}" SRC_SECRET_KEY="${secret}" DST_ACCESS_KEY="${key}" DST_SECRET_KEY="${secret}" \
+        python3 "${PROJECT_ROOT}/scripts/migrate_s3.py" "$@"
+}
+
+cmd_download() {
+    local backup_name="" custom_dest="" extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -b|--backup) backup_name="$(optval "$@")"; shift 2 ;;
+            -d|--dest)   custom_dest="$(optval "$@")"; shift 2 ;;
+            --workers)   extra+=(--workers "$(optval "$@")"); shift 2 ;;
+            *) log_error "Unknown option: $1"; usage 1 ;;
+        esac
+    done
+    [[ -n "${backup_name}" ]] || { log_error "Missing required argument: -b / --backup"; usage 1; }
+    backup_name="$(basename -- "${backup_name}" .tar.gz)"
+    validate_name "${backup_name}"
+
+    # Validate the storage settings before touching the filesystem
+    backup_s3_args src
+    local target_dir
+    target_dir="$(make_abs_dir "${custom_dest:-${DEST_ROOT}/downloads}")"
+    [[ ! -e "${target_dir}/${backup_name}.tar.gz" ]] \
+        || die "${target_dir}/${backup_name}.tar.gz already exists."
+    if [[ -d "${target_dir}/${backup_name}" ]]; then
+        log_info "Resuming download into ${target_dir}/${backup_name} (finished files are skipped)."
+    fi
+
+    local root
+    root="$(storage_root_path BACKUP)"
+    log_info "Downloading '${backup_name}' from $(describe_storage BACKUP) -> ${target_dir}"
+    run_migrator "${S3_ARGS[@]}" --src-prefix "${root}/${backup_name}" \
+        --dst-dir "${target_dir}" --dst-prefix "${backup_name}" ${extra[@]+"${extra[@]}"} \
+        || die "Download of '${backup_name}' FAILED; re-run the same command to resume."
+    [[ -d "${target_dir}/${backup_name}/meta" ]] \
+        || die "No backup named '${backup_name}' found in $(describe_storage BACKUP) (see: $(basename "$0") list --s3-only)."
+
+    # Leftovers of a killed earlier run must not end up in the archive
+    find "${target_dir}/${backup_name}" -type f -name '*.milbakman-partial' -exec rm -f -- {} + 2>/dev/null || true
+    finalize_local_backup "${target_dir}" "${backup_name}" "downloaded" "$(describe_storage BACKUP)/${backup_name}"
+    log_info "Restore it with: $(basename "$0") restore -b ${backup_name}"
+}
+
+cmd_upload() {
+    local backup_input="" extra=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -b|--backup) backup_input="$(optval "$@")"; shift 2 ;;
+            --workers)   extra+=(--workers "$(optval "$@")"); shift 2 ;;
+            *) log_error "Unknown option: $1"; usage 1 ;;
+        esac
+    done
+    [[ -n "${backup_input}" ]] || { log_error "Missing required argument: -b / --backup"; usage 1; }
+
+    resolve_local_backup "${backup_input}"
+    [[ -n "${FOUND_BACKUP_NAME}" ]] || die "No local backup '${backup_input}' found under ${DEST_ROOT}."
+    validate_name "${FOUND_BACKUP_NAME}"
+
+    backup_s3_args dst
+    local root
+    root="$(storage_root_path BACKUP)"
+    log_info "Uploading '${FOUND_BACKUP_NAME}' -> $(describe_storage BACKUP)/${FOUND_BACKUP_NAME}"
+    run_migrator --src-dir "${FOUND_BACKUP_DIR}" --src-prefix "${FOUND_BACKUP_NAME}" \
+        "${S3_ARGS[@]}" --dst-prefix "${root}/${FOUND_BACKUP_NAME}" ${extra[@]+"${extra[@]}"} \
+        || die "Upload of '${FOUND_BACKUP_NAME}' FAILED; re-run the same command to resume."
+    log_success "Uploaded. Restore from object storage with: $(basename "$0") restore --s3 -b ${FOUND_BACKUP_NAME}"
 }
 
 # ------------------------------------------------------------------------------
@@ -737,6 +846,8 @@ shift || true
 case "${COMMAND}" in
     backup)         cmd_backup "$@" ;;
     restore)        cmd_restore "$@" ;;
+    download)       cmd_download "$@" ;;
+    upload)         cmd_upload "$@" ;;
     list)           cmd_list "$@" ;;
     prune)          cmd_prune ;;
     status)         cmd_status ;;

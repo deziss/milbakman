@@ -81,6 +81,8 @@ Endpoint, port and SSL default sensibly per provider: MinIO uses `localhost:9000
 |---|---|
 | `backup [-c cadence] [-n name] [-d dir] [--s3\|--local] [--filter a,b]` | Back up the source. Local backups go to `BACKUP_STORAGE_DIR/<cadence>/` as `<name>.tar.gz` (or a directory if `BACKUP_COMPRESS=none`), with a `.manifest.json`. |
 | `restore -b <name\|archive\|dir> [-t target\|source] [-s suffix] [--drop] [--filter a,b] [--s3]` | Restore into the target (or source). A name is looked up locally first, then in object storage. |
+| `download -b <name> [-d dir] [--workers n]` | Copy a backup from object storage to local disk (default `BACKUP_STORAGE_DIR/downloads/`). It becomes a normal local backup you can restore offline. |
+| `upload -b <name\|archive\|dir> [--workers n]` | Copy a local backup to object storage, for example to send it off-site. |
 | `list [--local-only\|--s3-only]` | List local and object-storage backups. |
 | `prune` | Apply `RETENTION_<CADENCE>`. This also runs after every local backup. |
 | `status` | Milvus health, storage summary and a `milvus-backup check`. |
@@ -88,6 +90,96 @@ Endpoint, port and SSL default sensibly per provider: MinIO uses `localhost:9000
 | `deploy-target [--reset]` / `down-target [-v]` | Start or stop a target Milvus wired to `TARGET_*` storage. With `TARGET_S3_PROVIDER=local` it bind-mounts `TARGET_LOCAL_DATA_DIR`. |
 | `verify --compare [--suffix S] [--collections a,b]` | Compare entity counts per collection between source and target. |
 | `verify [--collection C --count N]` / `seed` | Check, or create, the seeded benchmark collection. |
+| `version`, `help` | Print the version or the built-in help. |
+
+## Command cookbook
+
+### Back up
+
+```bash
+./milvus.sh backup                                   # local disk, cadence DEFAULT_CADENCE (daily)
+./milvus.sh backup --cadence hourly                  # -> backups/hourly/milvus_hourly_<timestamp>.tar.gz
+./milvus.sh backup --name before_upgrade             # custom name (letters, digits, _)
+./milvus.sh backup --filter products,users           # only these collections
+./milvus.sh backup --dest /mnt/nfs/milvus            # any mounted filesystem: NFS, SMB, USB...
+./milvus.sh backup --s3 --name nightly_01            # straight into object storage (BACKUP_* settings)
+BACKUP_COMPRESS=none ./milvus.sh backup              # keep a plain directory (fastest for huge backups)
+```
+
+### Download a backup to local disk
+
+```bash
+./milvus.sh list --s3-only                           # find the backup name
+./milvus.sh download --backup nightly_01             # -> backups/downloads/nightly_01.tar.gz
+./milvus.sh download -b nightly_01 -d /mnt/usb/milvus --workers 16
+./milvus.sh restore -b nightly_01                    # restore from the local copy, no cloud access needed
+```
+
+Downloads stream file by file with any file size, run in parallel, and resume: re-run the same command after a failure and finished files are skipped. Resume compares file sizes only; to force a clean copy, delete the partial `<name>/` folder first. A downloaded backup is packaged like any local backup, as a `.tar.gz` plus manifest, or a directory when `BACKUP_COMPRESS=none`. Downloads are never pruned.
+
+### Upload a local backup to object storage
+
+```bash
+./milvus.sh upload --backup milvus_daily_20261015_020000   # by name (searched under BACKUP_STORAGE_DIR)
+./milvus.sh upload -b /mnt/nfs/milvus/before_upgrade.tar.gz  # or an archive / directory path
+./milvus.sh restore --s3 -b before_upgrade                   # restore it from object storage later
+```
+
+`download` and `upload` talk to the backup storage over the S3 API. They work with MinIO, AWS S3, GCS with HMAC keys (provider `gcp`), Aliyun, Tencent, Huawei and other S3-compatible stores, using static access keys. For Azure, or native GCS auth, use `backup --s3` / `restore --s3`, which go through milvus-backup and support every provider.
+
+### Restore
+
+```bash
+./milvus.sh restore -b milvus_daily_20261015_020000          # local name -> target Milvus
+./milvus.sh restore -b backups/daily/x.tar.gz --drop         # archive path; drop existing collections first
+./milvus.sh restore -b nightly_01 --s3                       # skip local lookup, read object storage
+./milvus.sh restore -b nightly_01 -s _restored               # restore next to existing data as <coll>_restored
+./milvus.sh restore -b nightly_01 --filter products          # only some collections
+./milvus.sh restore -b nightly_01 -t source --drop           # roll the SOURCE Milvus back (careful)
+```
+
+### Inspect and maintain
+
+```bash
+./milvus.sh list                       # local + object-storage backups
+./milvus.sh list --local-only
+./milvus.sh status                     # Milvus health, storage, milvus-backup check, free disk
+./milvus.sh config                     # effective config for backups (secrets masked)
+./milvus.sh config target --s3         # effective config for an object-storage restore into the target
+./milvus.sh prune                      # apply retention now
+```
+
+### Target Milvus and verification
+
+```bash
+./milvus.sh deploy-target --reset      # fresh target Milvus on TARGET_* storage
+./milvus.sh restore -b nightly_01 --drop
+./milvus.sh verify --compare           # entity counts per collection: source vs target
+./milvus.sh verify --compare --suffix _restored --collections products,users
+./milvus.sh down-target                # stop it (add -v to delete its volumes)
+```
+
+### Demo / test data
+
+```bash
+docker compose -f docker-compose.primary.yml up -d   # demo source: Milvus + etcd + MinIO
+./milvus.sh seed                                     # 1,000 benchmark vectors into the source
+./milvus.sh verify --collection benchmark_vectors --count 1000   # after restoring into the target
+```
+
+### Schedule backups (cron)
+
+```cron
+# m h dom mon dow  command
+0 * * * *  /opt/milbakman/milvus.sh backup --cadence hourly  >> /var/log/milbakman.log 2>&1
+30 2 * * * /opt/milbakman/milvus.sh backup --cadence daily   >> /var/log/milbakman.log 2>&1
+0 3 * * 0  /opt/milbakman/milvus.sh backup --cadence weekly  >> /var/log/milbakman.log 2>&1
+0 4 * * *  /opt/milbakman/milvus.sh upload -b "$(ls -t /opt/milbakman/backups/daily/*.tar.gz | head -1)" >> /var/log/milbakman.log 2>&1
+```
+
+milbakman finds its `.env` next to `milvus.sh`, so cron needs no `cd`. Each run exits non-zero on failure, so your cron mailer or monitoring sees it.
+
+## Operational notes
 
 ### Large backups
 - Compression uses `pigz` (parallel gzip) when installed.
@@ -105,7 +197,7 @@ After each local backup, the oldest backups in that cadence folder beyond `RETEN
 
 ## Migrating object storage (any object size)
 
-`scripts/migrate_s3.sh` copies Milvus backups or raw Milvus data between any two S3-compatible endpoints. It uses only the Python standard library.
+`scripts/migrate_s3.sh` copies Milvus backups or raw Milvus data between any two S3-compatible endpoints. It uses only the Python standard library. `download` and `upload` use the same engine with a local directory on one side, and `scripts/migrate_s3.py --src-dir/--dst-dir` exposes that directly.
 
 - **Streaming:** objects go from source to destination without being held in memory or written to disk.
 - **Multipart upload:** used for objects of 64 MiB or more. Part size grows automatically to stay within 10,000 parts, so any object up to the S3 maximum of 5 TiB works.

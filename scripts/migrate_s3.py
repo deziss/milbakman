@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
-Zero-dependency S3-to-S3 object migration (Python 3.9+ standard library only).
+Zero-dependency object copy between S3-compatible storage and local disk
+(Python 3.9+ standard library only). Either side may be a bucket
+(--src-endpoint/--src-bucket) or a local directory on any mounted filesystem
+(--src-dir / --dst-dir): S3 -> S3, S3 -> disk (download), disk -> S3 (upload).
 
 - Streams every object: nothing is buffered in memory or written to disk.
 - Objects at or above --multipart-threshold-mib use multipart upload, so any
@@ -37,6 +40,8 @@ TIMEOUT_SECONDS = 300            # per socket operation, not per whole transfer
 MAX_PARTS = 10_000               # S3 multipart limit
 MIN_PART_SIZE = 5 * MiB          # S3 minimum for every part except the last
 MAX_OBJECT_SIZE = 5 * 1024 * 1024 * MiB  # 5 TiB
+CHUNK = 1 * MiB
+PARTIAL_SUFFIX = ".milbakman-partial"
 
 
 class S3Error(RuntimeError):
@@ -148,6 +153,10 @@ class S3Client:
         return req
 
     @staticmethod
+    def url(bucket, prefix):
+        return f"s3://{bucket}/{prefix}"
+
+    @staticmethod
     def _open(req):
         return urllib.request.urlopen(req, timeout=TIMEOUT_SECONDS)
 
@@ -243,17 +252,106 @@ class S3Client:
             pass
 
 
+class _Slice:
+    """File-like view of `length` bytes of an open file from its current offset."""
+
+    def __init__(self, f, length, status):
+        self.f, self.left, self.status = f, length, status
+
+    def read(self, n=-1):
+        if self.left <= 0:
+            return b""
+        if n is None or n < 0 or n > self.left:
+            n = self.left
+        data = self.f.read(n)
+        self.left -= len(data)
+        return data
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
+class LocalStore:
+    """A directory on any mounted filesystem, used in place of a bucket (bucket arg ignored)."""
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+
+    def url(self, bucket, prefix):
+        return os.path.join(self.root, prefix.strip("/"))
+
+    def _path(self, key):
+        parts = key.split("/")
+        if key.startswith("/") or any(part in ("", ".", "..") for part in parts):
+            raise S3Error(f"key '{key}' cannot be stored safely as a local file path")
+        return os.path.join(self.root, *parts)
+
+    def iter_objects(self, bucket, prefix=""):
+        base = os.path.join(self.root, *[part for part in prefix.strip("/").split("/") if part])
+        if not os.path.isdir(base):
+            raise S3Error(f"directory not found: {base}")
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames.sort()
+            for name in sorted(filenames):
+                full = os.path.join(dirpath, name)
+                if name.endswith(PARTIAL_SUFFIX) or os.path.islink(full) or not os.path.isfile(full):
+                    continue
+                yield {"key": os.path.relpath(full, self.root).replace(os.sep, "/"), "size": os.path.getsize(full)}
+
+    def head_size(self, bucket, key):
+        try:
+            return os.path.getsize(self._path(key))
+        except FileNotFoundError:
+            return None
+
+    def get(self, bucket, key, start=None, end=None):
+        f = open(self._path(key), "rb")
+        if start is None:
+            return _Slice(f, os.fstat(f.fileno()).st_size, 200)
+        f.seek(start)
+        return _Slice(f, end - start + 1, 206)
+
+    def put_stream(self, bucket, key, stream, length, params=None):
+        """Write via a temp file + atomic rename, so partial files never look complete."""
+        path = self._path(key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.{threading.get_ident()}{PARTIAL_SUFFIX}"
+        written = 0
+        try:
+            with open(tmp, "wb") as out:
+                while True:
+                    chunk = stream.read(CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+            if written != length:
+                raise S3Error(f"short read: got {written} of {length} bytes")
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        return None
+
+
 def copy_object(src, src_bucket, key, size, dst, dst_bucket, dst_key, threshold, min_part_size, retries):
     """Stream one object; returns a short description of how it was copied."""
     if size > MAX_OBJECT_SIZE:
         raise S3Error(f"object is {size} B; S3 maximum object size is 5 TiB")
 
-    if size == 0 or size < threshold:
+    # Writing to local disk always streams the whole object into one file
+    if size == 0 or size < threshold or isinstance(dst, LocalStore):
         def single():
             with src.get(src_bucket, key) as body:
                 dst.put_stream(dst_bucket, dst_key, body, size)
         with_retries(single, retries)
-        return "single PUT"
+        return "file" if isinstance(dst, LocalStore) else "single PUT"
 
     part_size = part_size_for(size, min_part_size)
     upload_id = with_retries(lambda: dst.create_multipart(dst_bucket, dst_key), retries)
@@ -300,7 +398,7 @@ def describe_error(e):
 
 def migrate(src, src_bucket, src_prefix, dst, dst_bucket, dst_prefix, *, dry_run=False, workers=8,
             threshold=64 * MiB, min_part_size=64 * MiB, retries=3):
-    print(f"[MIGRATOR] s3://{src_bucket}/{src_prefix} -> s3://{dst_bucket}/{dst_prefix} "
+    print(f"[MIGRATOR] {src.url(src_bucket, src_prefix)} -> {dst.url(dst_bucket, dst_prefix)} "
           f"(workers={workers}, multipart >= {threshold // MiB} MiB)", flush=True)
 
     lock = threading.Lock()
@@ -314,6 +412,8 @@ def migrate(src, src_bucket, src_prefix, dst, dst_bucket, dst_prefix, *, dry_run
     def task(obj):
         key, size = obj["key"], obj["size"]
         dst_key = map_key(key, src_prefix, dst_prefix)
+        if key.endswith("/") and size == 0:
+            return  # "folder" marker object, nothing to copy
         try:
             if with_retries(lambda: dst.head_size(dst_bucket, dst_key), retries) == size:
                 with lock:
@@ -356,7 +456,7 @@ def migrate(src, src_bucket, src_prefix, dst, dst_bucket, dst_prefix, *, dry_run
         print(f"\n[MIGRATOR] Dry run: {stats['seen']} objects ({mb:.2f} MiB) would be considered.")
         return True
     if stats["seen"] == 0:
-        print(f"[MIGRATOR] No objects found under s3://{src_bucket}/{src_prefix}")
+        print(f"[MIGRATOR] No objects found under {src.url(src_bucket, src_prefix)}")
         return True
 
     print(f"\n[MIGRATOR] {stats['seen']} objects: copied {stats['copied']} ({mb:.2f} MiB), "
@@ -366,22 +466,24 @@ def migrate(src, src_bucket, src_prefix, dst, dst_bucket, dst_prefix, *, dry_run
         for key, err in failures:
             print(f"  - {key}: {err}", file=sys.stderr)
         return False
-    print(f"[MIGRATOR SUCCESS] All objects are present in s3://{dst_bucket}/{dst_prefix}")
+    print(f"[MIGRATOR SUCCESS] All objects are present in {dst.url(dst_bucket, dst_prefix)}")
     return True
 
 
 def main():
-    p = argparse.ArgumentParser(description="Zero-dependency S3-to-S3 object migration (any object size)")
-    p.add_argument("--src-endpoint", required=True, help="Source endpoint (host:port or URL)")
-    p.add_argument("--src-bucket", required=True)
+    p = argparse.ArgumentParser(description="Copy objects between S3-compatible storage and local disk (any size)")
+    p.add_argument("--src-endpoint", help="Source endpoint (host:port or URL)")
+    p.add_argument("--src-bucket")
+    p.add_argument("--src-dir", help="use a local directory as the source instead of a bucket")
     p.add_argument("--src-prefix", default="")
     p.add_argument("--src-access-key", default=os.environ.get("SRC_ACCESS_KEY"), help="or env SRC_ACCESS_KEY")
     p.add_argument("--src-secret-key", default=os.environ.get("SRC_SECRET_KEY"), help="or env SRC_SECRET_KEY")
     p.add_argument("--src-region", default="us-east-1")
     p.add_argument("--src-ssl", default="false", choices=["true", "false"])
 
-    p.add_argument("--dst-endpoint", required=True, help="Destination endpoint (host:port or URL)")
-    p.add_argument("--dst-bucket", required=True)
+    p.add_argument("--dst-endpoint", help="Destination endpoint (host:port or URL)")
+    p.add_argument("--dst-bucket")
+    p.add_argument("--dst-dir", help="use a local directory as the destination (download)")
     p.add_argument("--dst-prefix", default="", help="default: same as --src-prefix")
     p.add_argument("--dst-access-key", default=os.environ.get("DST_ACCESS_KEY"), help="or env DST_ACCESS_KEY")
     p.add_argument("--dst-secret-key", default=os.environ.get("DST_SECRET_KEY"), help="or env DST_SECRET_KEY")
@@ -397,12 +499,20 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="list what would be copied")
     args = p.parse_args()
 
-    missing = [name for name, val in [
-        ("--src-access-key / SRC_ACCESS_KEY", args.src_access_key),
-        ("--src-secret-key / SRC_SECRET_KEY", args.src_secret_key),
-        ("--dst-access-key / DST_ACCESS_KEY", args.dst_access_key),
-        ("--dst-secret-key / DST_SECRET_KEY", args.dst_secret_key),
-    ] if not val]
+    for side in ("src", "dst"):
+        local_dir, endpoint, bucket = (getattr(args, f"{side}_{n}") for n in ("dir", "endpoint", "bucket"))
+        if local_dir and (endpoint or bucket):
+            p.error(f"use either --{side}-dir or --{side}-endpoint/--{side}-bucket, not both")
+        if not local_dir and not (endpoint and bucket):
+            p.error(f"--{side}-endpoint and --{side}-bucket are required (or --{side}-dir)")
+    if args.src_dir and args.dst_dir:
+        p.error("at least one side must be S3 (use cp/rsync for disk-to-disk)")
+
+    missing = []
+    for side in ("src", "dst"):
+        if not getattr(args, f"{side}_dir"):
+            missing += [f"--{side}-{n}-key / {side.upper()}_{n.upper()}_KEY"
+                        for n in ("access", "secret") if not getattr(args, f"{side}_{n}_key")]
     if missing:
         p.error("missing credentials: " + ", ".join(missing))
     if args.workers < 1 or args.retries < 1 or args.multipart_threshold_mib < 1:
@@ -410,8 +520,14 @@ def main():
     if args.part_size_mib < 5:
         p.error("--part-size-mib must be >= 5 (S3 minimum part size)")
 
-    src = S3Client(args.src_endpoint, args.src_access_key, args.src_secret_key, args.src_region, args.src_ssl == "true")
-    dst = S3Client(args.dst_endpoint, args.dst_access_key, args.dst_secret_key, args.dst_region, args.dst_ssl == "true")
+    def store(side):
+        if getattr(args, f"{side}_dir"):
+            return LocalStore(getattr(args, f"{side}_dir"))
+        return S3Client(getattr(args, f"{side}_endpoint"), getattr(args, f"{side}_access_key"),
+                        getattr(args, f"{side}_secret_key"), getattr(args, f"{side}_region"),
+                        getattr(args, f"{side}_ssl") == "true")
+
+    src, dst = store("src"), store("dst")
 
     try:
         ok = migrate(
