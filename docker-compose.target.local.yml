@@ -1,0 +1,10 @@
+# Override for a target Milvus that keeps its data on local disk instead of
+# object storage. Added automatically by `milvus.sh deploy-target` when
+# TARGET_S3_PROVIDER=local; TARGET_LOCAL_DATA_DIR is the host directory.
+services:
+  standalone:
+    environment:
+      COMMON_STORAGETYPE: local
+      LOCALSTORAGE_PATH: ${TARGET_LOCAL_MILVUS_PATH:-/var/lib/milvus/data}
+    volumes:
+      - ${TARGET_LOCAL_DATA_DIR_ABS:?set TARGET_LOCAL_DATA_DIR in .env}:${TARGET_LOCAL_MILVUS_PATH:-/var/lib/milvus/data}

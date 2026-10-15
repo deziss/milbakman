@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: bash -n milvus.sh templates/backup-config-generator.sh scripts/migrate_s3.sh
+
+      - name: ShellCheck
+        run: shellcheck -x -S warning milvus.sh templates/backup-config-generator.sh scripts/migrate_s3.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python compile
+        run: python -m py_compile scripts/*.py
+
+      - name: Generated config renders
+        run: |
+          cp .env.example .env
+          ./milvus.sh config source
+          ./milvus.sh config target --s3
+
+      - name: Compose files validate
+        run: |
+          cp .env.example .env
+          docker compose -f docker-compose.primary.yml config -q
+          docker compose -f docker-compose.target.yml config -q
+          TARGET_LOCAL_DATA_DIR_ABS=/tmp/milvus-data \
+            docker compose -f docker-compose.target.yml -f docker-compose.target.local.yml config -q

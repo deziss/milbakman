@@ -1,0 +1,72 @@
+name: milvus-target
+
+services:
+  etcd:
+    container_name: milvus-target-etcd
+    image: ${ETCD_IMAGE:-quay.io/coreos/etcd:v3.5.5}
+    restart: unless-stopped
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - target_etcd_data:/etcd
+    ports:
+      - "${TARGET_MILVUS_ETCD_PORT:-2389}:2379"
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir=/etcd
+    healthcheck:
+      test: ["CMD", "etcdctl", "endpoint", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - milvus-target-net
+
+  standalone:
+    container_name: milvus-target
+    image: ${MILVUS_IMAGE:-milvusdb/milvus:v2.4.15}
+    restart: unless-stopped
+    command: ["milvus", "run", "standalone"]
+    security_opt:
+      - seccomp:unconfined
+    environment:
+      ETCD_ENDPOINTS: etcd:2379
+      # Set by `milvus.sh deploy-target` from TARGET_* / shared storage settings.
+      # Defaults match the demo MinIO from docker-compose.primary.yml.
+      MINIO_ADDRESS: ${TARGET_MINIO_ADDRESS:-host.docker.internal:9000}
+      MINIO_CLOUD_PROVIDER: ${TARGET_MINIO_CLOUD_PROVIDER:-aws}
+      MINIO_ACCESS_KEY_ID: ${TARGET_MINIO_ACCESS_KEY-minioadmin}
+      MINIO_SECRET_ACCESS_KEY: ${TARGET_MINIO_SECRET_KEY-minioadmin}
+      MINIO_USE_SSL: "${TARGET_MINIO_USE_SSL:-false}"
+      MINIO_USE_IAM: "${TARGET_MINIO_USE_IAM:-false}"
+      MINIO_IAM_ENDPOINT: ${TARGET_MINIO_IAM_ENDPOINT:-}
+      MINIO_REGION: ${TARGET_MINIO_REGION:-us-east-1}
+      MINIO_BUCKET_NAME: ${TARGET_MINIO_BUCKET:-a-bucket}
+      MINIO_ROOT_PATH: ${TARGET_MINIO_ROOT_PATH:-target-files}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - target_milvus_data:/var/lib/milvus
+    ports:
+      - "${TARGET_MILVUS_PORT:-19540}:19530"
+      - "${TARGET_MILVUS_MGMT_PORT:-9092}:9091"
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - milvus-target-net
+
+volumes:
+  target_etcd_data:
+  target_milvus_data:
+
+networks:
+  milvus-target-net:
+    name: milvus-target-net

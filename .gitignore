@@ -1,0 +1,19 @@
+# Local configuration (copy .env.example to .env)
+.env
+
+# Local backups and demo stack data
+backups/
+data/
+.restore-*
+*.partial
+
+# Python
+__pycache__/
+*.py[cod]
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+*.log
